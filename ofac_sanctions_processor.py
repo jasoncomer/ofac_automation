@@ -123,6 +123,9 @@ def write_to_sheet(data, spreadsheet_id, range_name):
         else:  # Assuming 'Entity' or any other type
             entity_id = entry['lastName'].replace(' ', '_').lower()
         
+        # Replace periods with underscores and remove commas from entity_id
+        entity_id = entity_id.replace('.', '_').replace(',', '')
+        
         # Create a new row for each digital currency address
         for address in digital_currency_addresses:
             values.append([
