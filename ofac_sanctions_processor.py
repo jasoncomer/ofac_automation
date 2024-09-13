@@ -6,6 +6,8 @@ import boto3
 import os
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from datetime import datetime
+from googleapiclient.errors import HttpError
 
 # Define the namespace
 ns = {'ofac': 'https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/XML'}
@@ -50,7 +52,8 @@ def process_entry(entry):
         "lastName": entry.find("ofac:lastName", namespaces=ns).text if entry.find("ofac:lastName", namespaces=ns) is not None else "",
         "idList": [],
         "akaList": [],
-        "addressList": []
+        "addressList": [],
+        "websites": []
     }
     
     # Process idList
@@ -63,28 +66,20 @@ def process_entry(entry):
             result["idList"].append({"idType": id_type, "idNumber": id_number})
             if id_type in DIGITAL_CURRENCY_TYPES:
                 has_digital_currency = True
+            elif id_type == "Website":
+                result["websites"].append(id_number)
     
     if not has_digital_currency:
         return None
     
-    # Process akaList
-    aka_list = entry.find("ofac:akaList", namespaces=ns)
-    if aka_list is not None:
-        for aka in aka_list.findall("ofac:aka", namespaces=ns):
-            aka_type = aka.find("ofac:type", namespaces=ns).text if aka.find("ofac:type", namespaces=ns) is not None else ""
-            aka_name = aka.find("ofac:lastName", namespaces=ns).text if aka.find("ofac:lastName", namespaces=ns) is not None else ""
-            if aka.find("ofac:firstName", namespaces=ns) is not None:
-                aka_name = f"{aka.find('ofac:firstName', namespaces=ns).text} {aka_name}"
-            result["akaList"].append({"type": aka_type, "name": aka_name.strip()})
+    # Create entity_id
+    if result['sdnType'] == 'Individual':
+        result['entity_id'] = f"{result['firstName']}_{result['lastName']}".replace(' ', '_').lower()
+    else:
+        result['entity_id'] = result['lastName'].replace(' ', '_').lower()
     
-    # Process addressList
-    address_list = entry.find("ofac:addressList", namespaces=ns)
-    if address_list is not None:
-        for address in address_list.findall("ofac:address", namespaces=ns):
-            address_data = {}
-            for child in address:
-                address_data[child.tag.split('}')[-1]] = child.text
-            result["addressList"].append(address_data)
+    # Remove periods and commas from entity_id
+    result['entity_id'] = result['entity_id'].replace('.', '_').replace(',', '')
     
     return result
 
@@ -98,6 +93,60 @@ def upload_to_s3(filename, bucket_name, s3_key):
     s3 = boto3.client('s3')
     s3.upload_file(filename, bucket_name, s3_key)
 
+def read_existing_entity_ids(service, spreadsheet_id):
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range='SoT!C:C'
+        ).execute()
+        values = result.get('values', [])
+        return set(value[0] for value in values if value)
+    except HttpError as error:
+        print(f"An error occurred: {error}")
+        return set()
+
+def append_new_entity_ids(service, entities, existing_entity_ids):
+    new_spreadsheet_id = '1L87aWWnokU84mz_VbALqnTsqu1RhqJoHjWQnO-dVvJw'
+    new_values = []
+    current_date = datetime.now().strftime('%Y-%m-%d')
+
+    for entity in entities:
+        if entity['entity_id'] not in existing_entity_ids:
+            website = entity['websites'][0] if entity['websites'] else ''
+            display_name = f"{entity['firstName']} {entity['lastName']}".strip()
+            new_values.append([
+                current_date,  # Column A: Current date
+                'ofac_automation',  # Column B: Source
+                entity['entity_id'],  # Column C: entity_id
+                website,  # Column D: First website
+                display_name,  # Column E: Display name
+                'ofac sanctioned'  # Column F: Status
+            ])
+
+    if new_values:
+        try:
+            # First, get the current number of rows in the sheet
+            result = service.spreadsheets().values().get(
+                spreadsheetId=new_spreadsheet_id,
+                range='SoT!A:A'
+            ).execute()
+            last_row = len(result.get('values', []))
+
+            # Now append the new values after the last row
+            range_to_update = f'SoT!A{last_row + 1}:F{last_row + len(new_values)}'
+            body = {'values': new_values}
+            service.spreadsheets().values().update(
+                spreadsheetId=new_spreadsheet_id,
+                range=range_to_update,
+                valueInputOption='RAW',
+                body=body
+            ).execute()
+            print(f"Appended {len(new_values)} new entity_ids to the SoT spreadsheet after row {last_row}.")
+        except HttpError as error:
+            print(f"An error occurred while appending: {error}")
+    else:
+        print("No new entity_ids to append to the SoT spreadsheet.")
+
 def write_to_sheet(data, spreadsheet_id, range_name):
     # Set up credentials
     creds = Credentials.from_service_account_file(
@@ -110,6 +159,8 @@ def write_to_sheet(data, spreadsheet_id, range_name):
 
     # Prepare the data for writing
     values = [['UID', 'SDN Type', 'First Name', 'Last Name', 'Digital Currency Address', 'Entity ID', 'Websites']]
+    entities_to_append = []  # List to store entities for appending to the new sheet
+
     for entry in data:
         digital_currency_addresses = [id['idNumber'] for id in entry['idList'] if id['idType'] in DIGITAL_CURRENCY_TYPES]
         
@@ -137,6 +188,14 @@ def write_to_sheet(data, spreadsheet_id, range_name):
                 entity_id,
                 websites_str
             ])
+        
+        # Store entity information for appending to the new sheet
+        entities_to_append.append({
+            'entity_id': entity_id,
+            'firstName': entry['firstName'],
+            'lastName': entry['lastName'],
+            'websites': websites
+        })
 
     # Write to the sheet
     body = {'values': values}
@@ -144,6 +203,40 @@ def write_to_sheet(data, spreadsheet_id, range_name):
         spreadsheetId=spreadsheet_id, range=range_name,
         valueInputOption='RAW', body=body).execute()
     print(f"{result.get('updatedCells')} cells updated.")
+
+    # After writing to the original sheet, handle the SoT sheet
+    sot_spreadsheet_id = '1L87aWWnokU84mz_VbALqnTsqu1RhqJoHjWQnO-dVvJw'
+    try:
+        existing_entity_ids = read_existing_entity_ids(service, sot_spreadsheet_id)
+        append_new_entity_ids(service, entities_to_append, existing_entity_ids)
+    except HttpError as error:
+        print(f"An error occurred while handling the SoT sheet: {error}")
+
+def test_spreadsheet_access(spreadsheet_id):
+    creds = Credentials.from_service_account_file(
+        '/Users/jasoncomer/Desktop/explorer-master/OFAC_automation/ofac-automation-c10f419ade0d.json',
+        scopes=['https://www.googleapis.com/auth/spreadsheets']
+    )
+    service = build('sheets', 'v4', credentials=creds)
+    
+    try:
+        # Try to get the spreadsheet metadata
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        print(f"Successfully accessed spreadsheet: {sheet_metadata['properties']['title']}")
+        
+        # Try to read from the 'SoT' sheet
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range='SoT!A1:A2'
+        ).execute()
+        print(f"Successfully read from 'SoT' sheet. Values: {result.get('values', [])}")
+        
+    except HttpError as error:
+        print(f"An error occurred: {error}")
+        if error.resp.status == 404:
+            print("Spreadsheet not found. Please check the ID and permissions.")
+        elif error.resp.status == 403:
+            print("Permission denied. Please check that the service account has access to the spreadsheet.")
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -160,12 +253,14 @@ def main():
     entries = parse_xml_data(xml_file)
     processed_data = [entry for entry in (process_entry(entry) for entry in entries) if entry is not None]
     
-    spreadsheet_id = '1wht_3zc0dt5VwclbWq0KjEjaEAKGjRAblOFVe6pyfiE'
+    spreadsheet_id = '1wht_3zc0dt5VwclbWq0KjEjaEAKGjRAblOFVe6pyfiE'  # ofac_automation sheet
     range_name = 'ofac!A1'  # This will start writing from cell A1 in the 'ofac' tab
     
     write_to_sheet(processed_data, spreadsheet_id, range_name)
     
     print(f"Processed {len(processed_data)} entries with digital currency addresses. Data written to Google Sheet.")
+    
+    test_spreadsheet_access('1L87aWWnokU84mz_VbALqnTsqu1RhqJoHjWQnO-dVvJw')
 
 if __name__ == "__main__":
     main()
